@@ -214,6 +214,18 @@ Multiple limits run concurrently. The **first violation** terminates the process
 
 Note: CPU time (RLIMIT_CPU) is enforced by the kernel independently of the polling loop, so it may trigger between polls.
 
+### Without a Wall-Clock Timeout
+
+All limits above are enforced whether or not a wall-clock timeout is set. Passing a
+duration of `0` ("no timeout", run forever) still enforces `--mem-limit`,
+`--cpu-time`, `--cpu-percent`, and the `--heartbeat` / `--stdin-timeout` monitors —
+the process runs until it exits, a limit is breached, or a signal arrives.
+
+```bash
+# no wall-clock kill, but memory is still capped at 512M
+timeout --mem-limit 512M 0 ./long-running-service
+```
+
 ### JSON Output
 
 With `--json`, limits appear in the output:
