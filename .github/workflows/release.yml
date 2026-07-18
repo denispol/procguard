@@ -12,6 +12,11 @@
 #   - procguard-macos-x86_64.tar.gz     (Intel)
 #   - procguard-macos-universal.tar.gz  (Universal binary, used by Homebrew)
 #
+# After publishing, it dispatches `update-formula` to denispol/homebrew-tap
+# (using HOMEBREW_TAP_TOKEN) to bump the formula. This runs here rather than in a
+# separate on:release workflow because releases created with GITHUB_TOKEN do not
+# trigger downstream workflow runs.
+#
 # Usage:
 #   git tag -a v1.0.0 -m "v1.0.0"
 #   git push origin v1.0.0
@@ -125,3 +130,16 @@ jobs:
           files: dist/*.tar.gz
           draft: false
           prerelease: false
+
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          # Releases created with GITHUB_TOKEN cannot trigger the tap's on:release
+          # workflow, so dispatch update-formula directly. The sha256 is taken from
+          # the exact universal artifact just uploaded to this release.
+          SHA=$(shasum -a 256 dist/procguard-macos-universal.tar.gz | cut -d' ' -f1)
+          echo "universal sha256: ${SHA}"
+          jq -n --arg v "${{ github.ref_name }}" --arg s "${SHA}" \
+            '{event_type: "update-formula", client_payload: {version: $v, sha256: $s}}' \
+            | gh api -X POST repos/denispol/homebrew-tap/dispatches --input -
