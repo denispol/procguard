@@ -809,8 +809,17 @@ pub fn run_command(command: &str, args: &[String], config: &RunConfig) -> Result
         SpawnError::InvalidArg => TimeoutError::Internal("invalid argument".to_string()),
     })?;
 
-    /* zero timeout = run forever */
-    if is_no_timeout(&config.timeout) {
+    /* mem-limit polling, cpu-percent throttle, heartbeat, and stdin-idle are only
+     * driven inside monitor_with_timeout. cpu_time is a spawn-time RLIMIT_CPU and
+     * needs no monitor, so it is not counted here. */
+    let needs_runtime_monitoring = config.limits.mem_bytes.is_some()
+        || config.cpu_throttle.is_some()
+        || config.heartbeat.is_some()
+        || config.stdin_timeout.is_some();
+
+    /* zero timeout = run forever: keep the zero-overhead wait only when there is
+     * nothing to monitor; otherwise fall through so limits are still enforced. */
+    if is_no_timeout(&config.timeout) && !needs_runtime_monitoring {
         let (status, rusage) = child.wait().map_err(|e| match e {
             SpawnError::Wait(errno) => TimeoutError::SpawnError(errno),
             _ => TimeoutError::Internal("wait failed".to_string()),
@@ -1001,11 +1010,19 @@ fn monitor_with_timeout(child: &mut RawChild, config: &RunConfig) -> Result<RunR
             check_interval_ns: duration_to_ns(Duration::from_millis(100)), /* poll every 100ms */
         });
 
+    /* zero duration = run forever: no wall-clock deadline, but still monitor
+     * limits/throttle/heartbeat/stdin until the child exits. */
+    let wall_timeout = if is_no_timeout(&config.timeout) {
+        None
+    } else {
+        Some(config.timeout)
+    };
+
     /* wait for exit or timeout */
     let exit_result = wait_with_kqueue(
         child,
         pid,
-        config.timeout,
+        wall_timeout,
         config.confine,
         heartbeat_config,
         stdin_timeout_config,
@@ -1075,11 +1092,13 @@ fn monitor_with_timeout(child: &mut RawChild, config: &RunConfig) -> Result<RunR
 
             /* wait for child with kill_after grace period if configured */
             if let Some(kill_after) = config.kill_after {
-                /* throttle disabled - process needs to run signal handler */
+                /* throttle disabled - process needs to run signal handler.
+                 * Some(kill_after) keeps a finite grace: --kill-after 0 escalates
+                 * immediately, unlike the None (no-deadline) main wait. */
                 let grace_result = wait_with_kqueue(
                     child,
                     pid,
-                    kill_after,
+                    Some(kill_after),
                     config.confine,
                     None,
                     None,
@@ -1189,7 +1208,7 @@ fn monitor_with_timeout(child: &mut RawChild, config: &RunConfig) -> Result<RunR
         let grace_result = wait_with_kqueue(
             child,
             pid,
-            kill_after,
+            Some(kill_after),
             config.confine,
             None,
             None,
@@ -1418,7 +1437,7 @@ fn stdin_poll_status() -> StdinPollResult {
 fn wait_with_kqueue(
     child: &mut RawChild,
     pid: i32,
-    timeout: Duration,
+    wall_timeout: Option<Duration>,
     confine: Confine,
     heartbeat: Option<HeartbeatConfig>,
     mut stdin_timeout: Option<StdinTimeoutConfig>,
@@ -1426,7 +1445,9 @@ fn wait_with_kqueue(
     memory_limit: Option<MemoryLimitConfig>,
 ) -> Result<WaitResult> {
     let start_ns = precise_now_ns(confine)?;
-    let timeout_ns = duration_to_ns(timeout);
+    /* None = no wall-clock deadline (run until exit / periodic checks only).
+     * Some(ZERO) is a finite, already-reached deadline (immediate). */
+    let timeout_ns = wall_timeout.map_or(0, duration_to_ns);
 
     /* throttle tracking */
     let throttle_interval_ns = throttle
@@ -1601,7 +1622,12 @@ fn wait_with_kqueue(
      * With heartbeat: timer fires at min(remaining_timeout, time_to_next_heartbeat).
      * With stdin timeout: timer fires at min(remaining_timeout, stdin_deadline).
      */
-    let deadline_ns = advance_ns(start_ns, timeout_ns);
+    /* no wall-clock deadline: u64::MAX is never reached, so the loop wakes only on
+     * periodic checks (mem/throttle/heartbeat/stdin) and EVFILT_PROC. */
+    let deadline_ns = match wall_timeout {
+        Some(_) => advance_ns(start_ns, timeout_ns),
+        None => u64::MAX,
+    };
 
     loop {
         /* check if we've passed deadline */

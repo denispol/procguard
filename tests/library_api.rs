@@ -197,6 +197,53 @@ fn library_run_with_retry_retries_on_timeout() {
 }
 
 /* =========================================================================
+ * RESOURCE LIMITS WITH ZERO TIMEOUT
+ * ========================================================================= */
+
+#[test]
+fn library_mem_limit_enforced_with_zero_timeout() {
+    /*
+     * limits must be enforced even when timeout is zero ("run forever").
+     * regression: run_command previously took a plain wait() fast path that
+     * skipped all monitoring when the timeout was zero.
+     */
+    use procguard::ResourceLimits;
+
+    let _ = setup_signal_forwarding();
+
+    let config = RunConfig {
+        timeout: Duration::ZERO, /* no wall-clock timeout */
+        quiet: true,
+        kill_after: Some(Duration::from_millis(50)),
+        limits: ResourceLimits {
+            mem_bytes: Some(5 * 1024 * 1024), /* 5 MiB */
+            cpu_time: None,
+        },
+        ..RunConfig::default()
+    };
+    let args = [
+        "-c".to_string(),
+        "import time; x = [0] * (50 * 1024 * 1024 // 8); time.sleep(10)".to_string(),
+    ];
+
+    let result = run_command("python3", &args, &config).expect("run_command should succeed");
+
+    match result {
+        RunResult::MemoryLimitExceeded {
+            limit_bytes,
+            actual_bytes,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 5 * 1024 * 1024);
+            assert!(actual_bytes > limit_bytes);
+        }
+        _ => panic!("expected MemoryLimitExceeded with zero timeout, got other variant"),
+    }
+
+    cleanup_signal_forwarding();
+}
+
+/* =========================================================================
  * PARSING HELPERS
  * ========================================================================= */
 

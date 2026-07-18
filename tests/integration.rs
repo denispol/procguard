@@ -3426,6 +3426,165 @@ fn test_cpu_time_kills_cpu_intensive() {
     );
 }
 
+/* -------------------------------------------------------------------------
+ * ZERO-DURATION ENFORCEMENT - runtime monitoring with no wall-clock timeout.
+ * Regression: the zero-duration ("run forever") fast path used to skip all
+ * post-spawn monitoring, silently disabling mem-limit/cpu-percent/heartbeat/
+ * stdin-timeout while only spawn-time RLIMIT_CPU survived.
+ * ------------------------------------------------------------------------- */
+
+#[test]
+fn test_mem_limit_kills_on_exceed_zero_duration() {
+    /*
+     * --mem-limit must still kill when there is no wall-clock timeout (0).
+     * Without the fix, the child would sleep and exit 0 unmonitored.
+     */
+    let output = timeout_cmd()
+        .args([
+            "--json",
+            "--mem-limit=5M",
+            "0", /* no wall-clock timeout */
+            "python3",
+            "-c",
+            "import time; x = [0] * (50 * 1024 * 1024 // 8); time.sleep(10)",
+        ])
+        .output()
+        .expect("command should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""status":"memory_limit""#),
+        "mem-limit should be enforced with duration 0: {}",
+        stdout
+    );
+    assert!(
+        !output.status.success(),
+        "process should be killed by mem-limit with duration 0: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cpu_percent_throttles_with_zero_duration() {
+    /*
+     * --cpu-percent must still engage the SIGSTOP/SIGCONT throttle with no
+     * wall-clock timeout (0). The busy loop is wall-bounded so it exits on its
+     * own; we assert the throttled path runs without hanging or being killed.
+     */
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let output = timeout_cmd()
+        .args([
+            "--cpu-percent=20",
+            "0", /* no wall-clock timeout */
+            "sh",
+            "-c",
+            "i=0; end=$(($(date +%s) + 1)); while [ $(date +%s) -lt $end ]; do i=$((i+1)); done",
+        ])
+        .output()
+        .expect("command should run");
+    let elapsed = start.elapsed();
+
+    /* the throttle path must run to completion (not be skipped, not hang, not
+     * spuriously kill the child) with no wall-clock timeout. */
+    assert!(
+        output.status.success(),
+        "throttled command should complete with duration 0: {:?}",
+        output.status
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "throttled command should not hang with duration 0 (took {:?})",
+        elapsed
+    );
+}
+
+#[test]
+fn test_heartbeat_with_zero_duration() {
+    /*
+     * --heartbeat must still emit ticks with no wall-clock timeout (0).
+     * sleep exits on its own; heartbeat fires during the run.
+     */
+    let output = timeout_cmd()
+        .args(["--heartbeat", "200ms", "0", "sleep", "1"])
+        .output()
+        .expect("failed to run command");
+
+    assert!(
+        output.status.success(),
+        "sleep should complete with duration 0: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timeout: heartbeat:"),
+        "heartbeat should fire with duration 0: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_stdin_timeout_with_zero_duration() {
+    /*
+     * --stdin-timeout must still fire with no wall-clock timeout (0).
+     * Keep an open, idle pipe so the idle timer (not EOF) triggers -> exit 124.
+     */
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(timeout_bin_path().as_str())
+        .args(["--stdin-timeout", "200ms", "0", "sleep", "60"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn");
+
+    let _stdin = child.stdin.take(); /* keep pipe open and idle */
+    let status = child.wait().expect("failed to wait");
+    assert_eq!(
+        status.code(),
+        Some(124),
+        "stdin idle timeout should fire with duration 0"
+    );
+}
+
+#[test]
+fn test_kill_after_zero_escalates_immediately_zero_grace() {
+    /*
+     * --kill-after 0 must escalate to SIGKILL immediately (a finite, already-
+     * reached grace deadline), not hang. Guards the wait_with_kqueue
+     * Option<Duration> change: Some(ZERO) differs from None (no wall clock).
+     * The child ignores SIGTERM, so escalation is required to stop it.
+     */
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let output = timeout_cmd()
+        .args([
+            "-s",
+            "TERM",
+            "-k",
+            "0",
+            "1s",
+            "sh",
+            "-c",
+            "trap '' TERM; sleep 30",
+        ])
+        .output()
+        .expect("command should run");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "--kill-after 0 should escalate immediately, not hang: {:?}",
+        elapsed
+    );
+    let code = output.status.code().unwrap_or(0);
+    assert!(
+        code == 137 || code == 124 || !output.status.success(),
+        "process should be force-killed with kill-after 0 (got {})",
+        code
+    );
+}
+
 /* =========================================================================
  * DUAL BINARY BEHAVIOR - procguard vs timeout alias
  * ========================================================================= */
